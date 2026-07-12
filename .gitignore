@@ -1,0 +1,9 @@
+# Real, filled-in configs contain account-specific paths/remote names and
+# must never be committed here - keep them outside this repo entirely.
+# This rule only exists as a safety net; config/config.example.conf (the
+# template, with placeholders) is explicitly allowed below.
+*.conf
+!config/config.example.conf
+
+.DS_Store
+*.swp

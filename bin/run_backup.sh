@@ -21,9 +21,12 @@
 #   - Otherwise: runs bin/backup_staging.sh with the same config, then
 #     `restic backup` of the staging dir against the configured repo, then
 #     `restic forget` with the configured retention policy (--prune only on
-#     the configured PRUNE_DAY, since prune is the expensive repack step).
+#     the configured PRUNE_DAY, optionally narrowed to PRUNE_HOUR_UTC too).
 #   - Any failure calls the configured NOTIFY_CMD (if set); if unset, logs a
 #     warning line instead of failing silently.
+#   - Non-blocking overlap guard (flock on <STAGING_DIR>.run_backup.lock):
+#     if a previous run is still going when this one fires, this run logs
+#     and exits 0 rather than racing the same STAGING_DIR.
 
 set -uo pipefail
 
@@ -48,8 +51,23 @@ RETENTION_DAILY="${RETENTION_DAILY:-14}"
 RETENTION_WEEKLY="${RETENTION_WEEKLY:-8}"
 RETENTION_MONTHLY="${RETENTION_MONTHLY:-6}"
 PRUNE_DAY="${PRUNE_DAY:-7}"
+PRUNE_HOUR_UTC="${PRUNE_HOUR_UTC:-}"
 NOTIFY_CMD="${NOTIFY_CMD:-}"
 RESTIC_TAG="${RESTIC_TAG:-backup}"
+
+# --- Overlap guard -----------------------------------------------------
+# A run on a 1-2 hourly cron can, in principle, still be going (slow
+# network, large snapshot) when the next one fires; two runs racing on the
+# same STAGING_DIR (wiped and rebuilt by backup_staging.sh) could back up
+# a half-built tree. Non-blocking flock: if another run already holds the
+# lock, log and exit 0 rather than treating it as a failure - it isn't
+# one, the other run is doing the work.
+LOCK_FILE="${STAGING_DIR%/}.run_backup.lock"
+exec 200>"$LOCK_FILE" || { echo "run_backup.sh: FATAL - cannot open lock file $LOCK_FILE" >&2; exit 1; }
+if ! flock -n 200; then
+    echo "$(date -u +%FT%TZ) run_backup.sh: SKIPPED - another run_backup.sh invocation already holds the lock ($LOCK_FILE); not overlapping it"
+    exit 0
+fi
 
 log() {
     echo "$(date -u +%FT%TZ) run_backup.sh: $1"
@@ -98,7 +116,7 @@ log "backup_staging.sh output: $STAGING_OUTPUT"
 if [ "$STAGING_STATUS" -ne 0 ]; then
     log "FAILED - backup_staging.sh exited $STAGING_STATUS"
     notify_failure "Backup FAILED: staging step" \
-        "run_backup.sh: backup_staging.sh exited $STAGING_STATUS. Output:\n$STAGING_OUTPUT"
+        "run_backup.sh: backup_staging.sh exited $STAGING_STATUS. Output:"$'\n'"$STAGING_OUTPUT"
     exit 1
 fi
 
@@ -109,16 +127,33 @@ log "restic backup output: $RESTIC_OUTPUT"
 if [ "$RESTIC_STATUS" -ne 0 ]; then
     log "FAILED - restic backup exited $RESTIC_STATUS"
     notify_failure "Backup FAILED: restic backup step" \
-        "run_backup.sh: restic backup to $RESTIC_REPO exited $RESTIC_STATUS. Output:\n$RESTIC_OUTPUT"
+        "run_backup.sh: restic backup to $RESTIC_REPO exited $RESTIC_STATUS. Output:"$'\n'"$RESTIC_OUTPUT"
     exit 1
 fi
 
 # --- 3. Retention: forget every run, prune only on PRUNE_DAY ----------------
-
+#
+# PRUNE_HOUR_UTC is optional. Left unset (the default), --prune is added
+# on every invocation that falls on PRUNE_DAY - matching the original
+# behaviour this was generalised from, which on an every-2-hours cron
+# means --prune runs ~12 times on the prune day, not once. That is
+# tolerated by design (forget/prune is safe to run repeatedly, just more
+# I/O than strictly needed) rather than changed by default, since it's an
+# existing consumer's already-relied-on behaviour. Set PRUNE_HOUR_UTC
+# (0-23) if you want --prune gated to a single hour on PRUNE_DAY instead.
 PRUNE_FLAG=""
 if [ -n "$PRUNE_DAY" ] && [ "$(date -u +%u)" -eq "$PRUNE_DAY" ]; then
-    PRUNE_FLAG="--prune"
-    log "configured prune day (UTC) - forget will include --prune"
+    HOUR_MATCH=1
+    if [ -n "$PRUNE_HOUR_UTC" ]; then
+        # 10# forces base-10 so a zero-padded hour (e.g. "08") isn't
+        # misread as an invalid octal literal by bash arithmetic.
+        CURRENT_HOUR_UTC="$(date -u +%H)"
+        [ "$((10#$CURRENT_HOUR_UTC))" -eq "$((10#$PRUNE_HOUR_UTC))" ] || HOUR_MATCH=0
+    fi
+    if [ "$HOUR_MATCH" -eq 1 ]; then
+        PRUNE_FLAG="--prune"
+        log "configured prune day (UTC)${PRUNE_HOUR_UTC:+/hour} - forget will include --prune"
+    fi
 fi
 
 FORGET_OUTPUT=$(restic -r "$RESTIC_REPO" forget \
@@ -131,7 +166,7 @@ log "restic forget output: $FORGET_OUTPUT"
 if [ "$FORGET_STATUS" -ne 0 ]; then
     log "FAILED - restic forget exited $FORGET_STATUS"
     notify_failure "Backup FAILED: retention (forget${PRUNE_FLAG:+/prune}) step" \
-        "run_backup.sh: restic forget${PRUNE_FLAG:+ --prune} on $RESTIC_REPO exited $FORGET_STATUS. Output:\n$FORGET_OUTPUT"
+        "run_backup.sh: restic forget${PRUNE_FLAG:+ --prune} on $RESTIC_REPO exited $FORGET_STATUS. Output:"$'\n'"$FORGET_OUTPUT"
     exit 1
 fi
 

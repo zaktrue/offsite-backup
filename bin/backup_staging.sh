@@ -107,17 +107,34 @@ for rel_dir in "${STAGING_DIRS[@]}"; do
 done
 
 # --- 3. Everything else under SOURCE_ROOT: rsync ---------------------------
+#
+# A configured STAGING_DIRS entry that doesn't exist is skipped, not
+# failed - some consumers legitimately list a directory that isn't always
+# present (e.g. an optional images dir on a fresh setup). But if EVERY
+# configured entry is missing (typo, moved directory, wrong SOURCE_ROOT),
+# that is exactly the silent-empty-backup failure mode this check exists
+# to catch: staging would otherwise report a false "OK" over an empty
+# tree. FOUND_STAGING_DIRS_COUNT is checked in step 5 below.
 
+FOUND_STAGING_DIRS_COUNT=0
 for rel_dir in "${STAGING_DIRS[@]}"; do
     [ -n "$rel_dir" ] || continue
     src_dir="$SOURCE_ROOT/$rel_dir"
-    [ -d "$src_dir" ] || continue
+    if [ ! -d "$src_dir" ]; then
+        echo "backup_staging.sh: WARNING - configured STAGING_DIRS entry not found, skipping: $src_dir" >&2
+        continue
+    fi
+    FOUND_STAGING_DIRS_COUNT=$((FOUND_STAGING_DIRS_COUNT + 1))
     dest_dir="$STAGING_DIR/source/$rel_dir"
-    mkdir -p "$dest_dir"
+    mkdir -p "$dest_dir" || { fail "mkdir failed for $dest_dir"; continue; }
     if ! rsync -a "${RSYNC_EXCLUDES[@]}" "$src_dir/" "$dest_dir/"; then
         fail "rsync failed for $src_dir"
     fi
 done
+
+if [ "$STAGING_DIRS_COUNT" -gt 0 ] && [ "$FOUND_STAGING_DIRS_COUNT" -eq 0 ]; then
+    fail "every configured STAGING_DIRS entry was missing under SOURCE_ROOT=$SOURCE_ROOT - refusing to report a false OK over an empty tree; check SOURCE_ROOT and STAGING_DIRS in $CONFIG"
+fi
 
 # --- 4. Extra directories (outside SOURCE_ROOT), verbatim ------------------
 # Format: "label:path", e.g. a secrets vault or a bare git repo. .git is
@@ -138,7 +155,7 @@ for entry in "${EXTRA_DIRS[@]}"; do
         continue
     fi
     dest_dir="$STAGING_DIR/extra-$label"
-    mkdir -p "$dest_dir"
+    mkdir -p "$dest_dir" || { fail "mkdir failed for $dest_dir"; continue; }
     if ! rsync -a "${EXTRA_EXCLUDE_ARGS[@]}" "$path/" "$dest_dir/"; then
         fail "rsync failed for extra dir $path (label $label)"
     fi
