@@ -73,18 +73,43 @@ log() {
     echo "$(date -u +%FT%TZ) run_backup.sh: $1"
 }
 
+# Failure/recovery marker (2026-07-16, notif-smallfix-0716): a sibling file
+# next to STAGING_DIR, separate from LOCK_FILE. notify_failure() records
+# what failed here; a later successful run checks it and, if present, sends
+# an explicit "recovered" notice and clears it - so a failure alert is never
+# followed by silence (the owner previously had to infer resolution from a
+# gap in alerts, e.g. the 2026-07-16 07:45 lock failure that quietly
+# self-resolved at 07:55 with no follow-up notice).
+FAILURE_MARKER="${STAGING_DIR%/}.run_backup.failed"
+
 notify_failure() {
     # $1 = title, $2 = body. Best-effort: a notify problem is logged but
     # never raised - it must never mask the real failure or change this
     # script's exit code.
     local title="$1"
     local body="$2"
+    echo "${title}|$(date -u +%FT%TZ)" > "$FAILURE_MARKER" 2>/dev/null || true
     if [ -z "$NOTIFY_CMD" ]; then
         log "WARNING - no NOTIFY_CMD configured; failure not delivered anywhere but this log: $title"
         return
     fi
     if ! "$NOTIFY_CMD" "$title" "$body" "high" 2>/tmp/run_backup_notify_err.$$; then
         log "WARNING - NOTIFY_CMD ($NOTIFY_CMD) could not deliver the notification ($(tail -1 /tmp/run_backup_notify_err.$$ 2>/dev/null)); failure was: $title"
+    fi
+    rm -f /tmp/run_backup_notify_err.$$
+}
+
+notify_recovered() {
+    # $1 = title, $2 = body. Same best-effort contract as notify_failure(),
+    # but priority "medium" not "high" - this is good news, not an alarm.
+    local title="$1"
+    local body="$2"
+    if [ -z "$NOTIFY_CMD" ]; then
+        log "WARNING - no NOTIFY_CMD configured; recovery notice not delivered anywhere but this log: $title"
+        return
+    fi
+    if ! "$NOTIFY_CMD" "$title" "$body" "medium" 2>/tmp/run_backup_notify_err.$$; then
+        log "WARNING - NOTIFY_CMD ($NOTIFY_CMD) could not deliver the recovery notice ($(tail -1 /tmp/run_backup_notify_err.$$ 2>/dev/null))"
     fi
     rm -f /tmp/run_backup_notify_err.$$
 }
@@ -116,7 +141,7 @@ log "backup_staging.sh output: $STAGING_OUTPUT"
 if [ "$STAGING_STATUS" -ne 0 ]; then
     log "FAILED - backup_staging.sh exited $STAGING_STATUS"
     notify_failure "Backup FAILED: staging step" \
-        "run_backup.sh: backup_staging.sh exited $STAGING_STATUS. Output:"$'\n'"$STAGING_OUTPUT"
+        "The backup could not start - the staging step (gathering files to back up) failed. This is not auto-retried; it needs a look."$'\n\n'"Technical detail: run_backup.sh: backup_staging.sh exited $STAGING_STATUS. Output:"$'\n'"$STAGING_OUTPUT"
     exit 1
 fi
 
@@ -127,7 +152,7 @@ log "restic backup output: $RESTIC_OUTPUT"
 if [ "$RESTIC_STATUS" -ne 0 ]; then
     log "FAILED - restic backup exited $RESTIC_STATUS"
     notify_failure "Backup FAILED: restic backup step" \
-        "run_backup.sh: restic backup to $RESTIC_REPO exited $RESTIC_STATUS. Output:"$'\n'"$RESTIC_OUTPUT"
+        "Files were staged, but the upload to the backup repository failed. This is not auto-retried; it needs a look."$'\n\n'"Technical detail: run_backup.sh: restic backup to $RESTIC_REPO exited $RESTIC_STATUS. Output:"$'\n'"$RESTIC_OUTPUT"
     exit 1
 fi
 
@@ -163,12 +188,59 @@ FORGET_OUTPUT=$(restic -r "$RESTIC_REPO" forget \
 FORGET_STATUS=$?
 log "restic forget output: $FORGET_OUTPUT"
 
+# Stale-lock retry-before-alerting guard (2026-07-16, notif-smallfix-0716,
+# review recommendation 7): the 07:45 UTC "Backup FAILED" notification on
+# 2026-07-16 was a stale restic lock from an overlapping prior run that
+# cleared itself 10 minutes later with no owner-visible resolution. `restic
+# unlock` (no --remove-all) only removes locks restic itself judges stale
+# (owning process no longer alive) - it will refuse to touch a lock held by
+# a genuinely still-running restic, so this is safe to run unconditionally
+# whenever forget reports a lock conflict. One retry only; a lock that
+# survives the unlock+retry is treated as a real failure, not swallowed.
+if [ "$FORGET_STATUS" -ne 0 ] && printf '%s' "$FORGET_OUTPUT" | grep -qiE 'already locked|unable to create lock'; then
+    log "retention step hit a repository lock (likely stale, from an overlapping earlier run) - clearing stale locks only (restic unlock) and retrying once before alerting"
+    UNLOCK_OUTPUT=$(restic -r "$RESTIC_REPO" unlock 2>&1)
+    UNLOCK_STATUS=$?
+    log "restic unlock output: $UNLOCK_OUTPUT"
+    if [ "$UNLOCK_STATUS" -eq 0 ]; then
+        FORGET_OUTPUT=$(restic -r "$RESTIC_REPO" forget \
+            --keep-hourly "$RETENTION_HOURLY" --keep-daily "$RETENTION_DAILY" \
+            --keep-weekly "$RETENTION_WEEKLY" --keep-monthly "$RETENTION_MONTHLY" \
+            $PRUNE_FLAG 2>&1)
+        FORGET_STATUS=$?
+        log "restic forget retry (post-unlock) output: $FORGET_OUTPUT"
+        if [ "$FORGET_STATUS" -eq 0 ]; then
+            log "RECOVERED - stale lock cleared automatically, retention retry succeeded, no alert needed"
+        fi
+    else
+        log "WARNING - restic unlock itself failed ($UNLOCK_STATUS); not retrying forget"
+    fi
+fi
+
 if [ "$FORGET_STATUS" -ne 0 ]; then
     log "FAILED - restic forget exited $FORGET_STATUS"
-    notify_failure "Backup FAILED: retention (forget${PRUNE_FLAG:+/prune}) step" \
-        "run_backup.sh: restic forget${PRUNE_FLAG:+ --prune} on $RESTIC_REPO exited $FORGET_STATUS. Output:"$'\n'"$FORGET_OUTPUT"
+    PLAIN_LEAD="A backup completed successfully, but the retention/cleanup step (removing old snapshots) failed."
+    if printf '%s' "$FORGET_OUTPUT" | grep -qiE 'already locked|unable to create lock'; then
+        PLAIN_LEAD="A backup completed successfully, but a leftover lock from a previous run blocked the retention/cleanup step. This script already tried clearing the stale lock and retrying automatically - that did NOT clear it, so this needs a manual look (a lock this persistent may mean a process is genuinely still running, or stuck)."
+    fi
+    notify_failure "Backup retention step FAILED${PRUNE_FLAG:+ (prune day)}" \
+        "$PLAIN_LEAD"$'\n\n'"Technical detail: run_backup.sh: restic forget${PRUNE_FLAG:+ --prune} on $RESTIC_REPO exited $FORGET_STATUS. Output:"$'\n'"$FORGET_OUTPUT"
     exit 1
 fi
 
 log "OK - backup + retention completed successfully"
+
+# Resolution notice (2026-07-16, notif-smallfix-0716): if a PRIOR run left a
+# failure marker (see notify_failure()), this run's clean success clears it
+# and tells the owner plainly - avoids the "alarm-then-silence" pattern from
+# 2026-07-16's 07:45 lock failure, which self-resolved at 07:55 with no
+# follow-up notice of its own.
+if [ -f "$FAILURE_MARKER" ]; then
+    PRIOR_RECORD="$(cat "$FAILURE_MARKER" 2>/dev/null)"
+    log "RECOVERED - this run succeeded after a previous failure ($PRIOR_RECORD); sending resolution notice"
+    notify_recovered "Backup recovered" \
+        "The earlier backup failure has cleared - this run completed successfully with no errors."$'\n\n'"Previous failure record: ${PRIOR_RECORD:-unknown}"
+    rm -f "$FAILURE_MARKER"
+fi
+
 exit 0
