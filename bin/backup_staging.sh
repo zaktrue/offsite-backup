@@ -99,7 +99,7 @@ for rel_dir in "${STAGING_DIRS[@]}"; do
         rel_path="${db_path#"$SOURCE_ROOT"/}"
         dest_path="$STAGING_DIR/source/$rel_path"
         mkdir -p "$(dirname "$dest_path")" || { fail "mkdir failed for $dest_path"; continue; }
-        if ! sqlite3 "$db_path" ".backup '$dest_path'" 2>/tmp/backup_staging_sqlite_err.$$; then
+        if ! sqlite3 "$db_path" ".timeout 30000" ".backup '$dest_path'" 2>/tmp/backup_staging_sqlite_err.$$; then
             fail "sqlite3 .backup failed for $db_path: $(cat /tmp/backup_staging_sqlite_err.$$ 2>/dev/null)"
         fi
         rm -f /tmp/backup_staging_sqlite_err.$$
